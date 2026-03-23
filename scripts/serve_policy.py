@@ -16,7 +16,8 @@ class EnvMode(enum.Enum):
 
     ALOHA = "aloha"
     ALOHA_SIM = "aloha_sim"
-    DROID = "droid"
+    # DROID = "droid"
+    DROID = "droid_joint_pos"
     LIBERO = "libero"
 
 
@@ -65,9 +66,13 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         config="pi0_aloha_sim",
         dir="gs://openpi-assets/checkpoints/pi0_aloha_sim",
     ),
-    EnvMode.DROID: Checkpoint(
-        config="pi05_droid",
-        dir="gs://openpi-assets/checkpoints/pi05_droid",
+    # EnvMode.DROID: Checkpoint( # Uses velocity action space
+    #     config="pi05_droid",
+    #     dir="gs://openpi-assets/checkpoints/pi05_droid",
+    # ),
+    EnvMode.DROID: Checkpoint( # Uses position action space
+        config="pi05_full_droid_finetune",
+        dir="<path_to_joint_pos_droid_checkpoint>",  # TODO: fill in checkpoint path from Guy
     ),
     EnvMode.LIBERO: Checkpoint(
         config="pi05_libero",

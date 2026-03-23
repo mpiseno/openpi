@@ -31,17 +31,26 @@ class Args:
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
+    # task_suite_name: str = (
+    #     "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+    # )
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_simple"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90, libero_simple
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
-    num_trials_per_task: int = 50  # Number of rollouts per task
+    # num_trials_per_task: int = 50  # Number of rollouts per task
+    num_trials_per_task: int = 10  # Number of rollouts per task (reduced for testing purposes)
+
+    #################################################################################################################
+    # Policy parameters
+    #################################################################################################################
+    # Policy type being served. Used to format observations correctly and name the output directory.
+    # Options: "LIBERO", "DROID" 
+    policy_type: str = "LIBERO"
 
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/libero/videos"  # Path to save videos
-
     seed: int = 7  # Random Seed (for reproducibility)
 
 
@@ -49,13 +58,16 @@ def eval_libero(args: Args) -> None:
     # Set random seed
     np.random.seed(args.seed)
 
+    # Derive output directory from task suite and policy type
+    video_out_path = pathlib.Path(f"data/libero/videos_suite={args.task_suite_name}_pol={args.policy_type}")
+
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    video_out_path.mkdir(parents=True, exist_ok=True)
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -67,6 +79,8 @@ def eval_libero(args: Args) -> None:
         max_steps = 520  # longest training demo has 505 steps
     elif args.task_suite_name == "libero_90":
         max_steps = 400  # longest training demo has 373 steps
+    elif args.task_suite_name == "libero_simple":
+        max_steps = 200  # simple 2-item tasks need fewer steps
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
@@ -74,12 +88,15 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    per_task_results = []  # list of (task_description, successes, episodes)
+
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
 
-        # Get default LIBERO initial states
-        initial_states = task_suite.get_task_init_states(task_id)
+        # Get default LIBERO initial states (not needed for libero_simple)
+        if args.task_suite_name != "libero_simple":
+            initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
@@ -89,12 +106,14 @@ def eval_libero(args: Args) -> None:
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
-            # Reset environment
-            env.reset()
+            # Reset environment and set initial state
             action_plan = collections.deque()
-
-            # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
+            if args.task_suite_name == "libero_simple":
+                # libero_simple has no pre-generated init states; sample fresh each episode
+                obs = env.reset()
+            else:
+                env.reset()
+                obs = env.set_init_state(initial_states[episode_idx])
 
             # Setup
             t = 0
@@ -122,23 +141,11 @@ def eval_libero(args: Args) -> None:
                     )
 
                     # Save preprocessed image for replay video
-                    replay_images.append(img)
+                    replay_images.append(np.concatenate([img, wrist_img], axis=1))
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
-                        # Prepare observations dict
-                        element = {
-                            "observation/image": img,
-                            "observation/wrist_image": wrist_img,
-                            "observation/state": np.concatenate(
-                                (
-                                    obs["robot0_eef_pos"],
-                                    _quat2axisangle(obs["robot0_eef_quat"]),
-                                    obs["robot0_gripper_qpos"],
-                                )
-                            ),
-                            "prompt": str(task_description),
-                        }
+                        element = _prepare_observation(obs, img, wrist_img, task_description, args.policy_type)
 
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
@@ -148,6 +155,11 @@ def eval_libero(args: Args) -> None:
                         action_plan.extend(action_chunk[: args.replan_steps])
 
                     action = action_plan.popleft()
+
+                    if args.policy_type == "DROID":
+                        # These policies output joint-space actions (14-dim and 8-dim respectively).
+                        # LIBERO env.step() expects 7-dim EEF delta actions, so truncate to 7.
+                        action = action[:7]
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
@@ -168,7 +180,7 @@ def eval_libero(args: Args) -> None:
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                video_out_path / f"rollout_{task_segment}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
@@ -178,12 +190,63 @@ def eval_libero(args: Args) -> None:
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
+        per_task_results.append((task_description, task_successes, task_episodes))
+
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+
+    _write_stats(video_out_path, args, per_task_results, total_successes, total_episodes)
+
+
+def _prepare_observation(obs, img, wrist_img, task_description, policy_type):
+    """Build the observation dict in the format expected by the served policy."""
+    if policy_type == "LIBERO":
+        state = np.concatenate((
+            obs["robot0_eef_pos"],
+            _quat2axisangle(obs["robot0_eef_quat"]),
+            obs["robot0_gripper_qpos"],
+        ))
+        return {
+            "observation/image": img,
+            "observation/wrist_image": wrist_img,
+            "observation/state": state,
+            "prompt": str(task_description),
+        }
+    elif policy_type == "DROID":
+        # DroidInputs expects flat observation keys with joint-space state.
+        return {
+            "observation/exterior_image_1_left": img,
+            "observation/wrist_image_left": wrist_img,
+            "observation/joint_position": obs["robot0_joint_pos"],       # (7,)
+            "observation/gripper_position": obs["robot0_gripper_qpos"][:1],  # (1,)
+            "prompt": str(task_description),
+        }
+
+
+def _write_stats(out_path, args, per_task_results, total_successes, total_episodes):
+    """Write evaluation statistics to stats.txt in the output directory."""
+    lines = [
+        f"Task suite:   {args.task_suite_name}",
+        f"Policy type:  {args.policy_type}",
+        f"Trials/task:  {args.num_trials_per_task}",
+        f"Seed:         {args.seed}",
+        "",
+        f"Overall success rate: {total_successes}/{total_episodes} "
+        f"({total_successes / total_episodes * 100:.1f}%)",
+        "",
+        "Per-task results:",
+    ]
+    for task_description, successes, episodes in per_task_results:
+        rate = successes / episodes * 100 if episodes > 0 else 0.0
+        lines.append(f"  {task_description}: {successes}/{episodes} ({rate:.1f}%)")
+
+    stats_path = out_path / "stats.txt"
+    stats_path.write_text("\n".join(lines) + "\n")
+    logging.info(f"Stats written to {stats_path}")
 
 
 def _get_libero_env(task, resolution, seed):
@@ -216,4 +279,4 @@ def _quat2axisangle(quat):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    tyro.cli(eval_libero)
+    eval_libero(tyro.cli(Args))

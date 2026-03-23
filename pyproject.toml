@@ -37,6 +37,8 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "mujoco>=3.0",
+    "ipdb>=0.13.13",
 ]
 
 
@@ -58,6 +60,15 @@ rlds = [
     "tensorflow-cpu==2.15.0",
     "tensorflow-datasets==4.9.9",
 ]
+droid = [
+    "sam3",
+    "pycocotools",
+    "scipy",
+
+    "tensorflow-cpu==2.15.0",
+    "tensorflow-datasets==4.9.9",
+    "mediapy",
+]
 
 [tool.uv]
 override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
@@ -66,6 +77,15 @@ override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 openpi-client = { workspace = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
+sam3 = { git = "https://github.com/facebookresearch/sam3" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.uv.workspace]
 members = ["packages/*"]

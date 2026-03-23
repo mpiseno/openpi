@@ -578,6 +578,18 @@ _CONFIGS = [
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
     TrainConfig(
+        # Same weights as pi05_aloha / pi05_base checkpoint, but with adapt_to_pi=False so
+        # that Aloha-specific joint-flip and gripper linearization transforms are not applied.
+        # Use this config when serving the base Pi0.5 checkpoint for non-Aloha environments
+        # (e.g. zero-shot evaluation in LIBERO).
+        name="pi05_base",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            assets=AssetsConfig(asset_id="trossen"),
+            adapt_to_pi=False,
+        ),
+    ),
+    TrainConfig(
         name="pi0_aloha_towel",
         model=pi0_config.Pi0Config(),
         data=LeRobotAlohaDataConfig(
