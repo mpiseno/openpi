@@ -77,6 +77,8 @@ EXTRA_CAMERA_KEYS = [
 SEGMENT_TYPE = "gripper"
 EXTRA_SITES = ["gripper_base_site", "left_follower_site", "right_follower_site"]
 
+N_VIS_VIDEOS = 30
+
 
 # ---------------------------------------------------------------------------
 # MuJoCo FK helpers
@@ -124,10 +126,10 @@ class Sim:
         steps: list,
         extrinsics: np.ndarray,
         intrinsics: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Run FK + segmentation for one episode.
 
-        Updates fovy from intrinsics, then returns left (N, 3), right (N, 3),
+        Updates fovy from intrinsics, then returns gripper_pos (N, 2, 3),
         masks (N, H, W) bool (True = any gripper pixel), and
         base_masks (N, H, W) bool (True = gripper base pixel, excluding fingers).
         """
@@ -139,7 +141,7 @@ class Sim:
         self.data.qpos[:7] = steps[0]["observation"]["joint_position"].numpy()
         mujoco.mj_forward(self.model, self.data)
 
-        left_positions, right_positions, masks, base_masks = [], [], [], []
+        gripper_positions, masks, base_masks = [], [], []
         for i, step in enumerate(steps):
             arm_pos = step["observation"]["joint_position"].numpy()
             # NOTE: Directly set qpos each step for more stable arm tracking, even though it disobeys the physics.
@@ -149,8 +151,9 @@ class Sim:
             self.data.ctrl[7] = 0.8 * step["observation"]["gripper_position"].numpy().item()
             for _ in range(decimation):
                 mujoco.mj_step(self.model, self.data)
-            left_positions.append(self.data.site("left_gripper_site").xpos.copy())
-            right_positions.append(self.data.site("right_gripper_site").xpos.copy())
+            left = self.data.site("left_gripper_site").xpos.copy()
+            right = self.data.site("right_gripper_site").xpos.copy()
+            gripper_positions.append(np.stack([left, right]))  # (2, 3)
 
             self._set_camera_extrinsic(extrinsics[i])
             self.seg_renderer.update_scene(self.data, camera="wrist_cam")
@@ -159,7 +162,7 @@ class Sim:
             masks.append(np.isin(geom_ids, self.gripper_geom_ids))
             base_masks.append(np.isin(geom_ids, self.base_geom_ids))
 
-        return np.stack(left_positions), np.stack(right_positions), np.stack(masks), np.stack(base_masks)
+        return np.stack(gripper_positions), np.stack(masks), np.stack(base_masks)  # (N,2,3), (N,H,W), (N,H,W)
 
 
 # ---------------------------------------------------------------------------
@@ -257,14 +260,10 @@ def apply_masks(
     return result
 
 
-def mask_camera(
-    frames: np.ndarray, masks: np.ndarray, base_masks: np.ndarray, fill_mask: bool = False
-) -> np.ndarray:
+def compute_mask(masks: np.ndarray, base_masks: np.ndarray) -> np.ndarray:
+    """Combine full and base masks into a single (N, H, W) bool mask per frame."""
     base_masks = dilate_masks(base_masks, kernel_size=16)
-    masks = np.logical_or(masks, base_masks) # combine
-    # masks = augment_masks_ellipses(masks)
-    masks = apply_masks(frames, masks, fill_mask=fill_mask)
-    return masks
+    return np.logical_or(masks, base_masks)
 
 
 # ---------------------------------------------------------------------------
@@ -282,28 +281,25 @@ def _encode_jpeg(frame_rgb: np.ndarray, quality: int = 95) -> bytes:
 
 def save_episode_tfrecord(
     raw_record: bytes,
-    masked_frames_by_cam: dict[str, np.ndarray],
+    masks_by_cam: dict[str, np.ndarray],
     output_path: Path,
     extra_obs: dict[str, np.ndarray] | None = None,
 ) -> None:
     """Write a modified episode TFRecord by editing the raw proto in place.
 
-    Parses the original SequenceExample, overwrites the JPEG bytes for the
-    requested camera keys, appends extra_obs as new float feature lists under
-    steps/observation/<key>, then writes the result. All other fields are
-    preserved verbatim.
+    Parses the original SequenceExample, adds a new bool feature list under
+    steps/observation/<cam_key>_gripper_mask for each camera, appends extra_obs
+    as new float feature lists under steps/observation/<key>, then writes the
+    result. All other fields are preserved verbatim.
     """
     seq_ex = tf.train.SequenceExample()
     seq_ex.ParseFromString(raw_record)
 
-    for cam_key, frames in masked_frames_by_cam.items():
-        feat = seq_ex.context.feature.get(f"steps/observation/{cam_key}")
-        if feat is None:
-            continue
-        for i, frame in enumerate(frames):
-            if i >= len(feat.bytes_list.value):
-                break
-            feat.bytes_list.value[i] = _encode_jpeg(frame)
+    for cam_key, frame_masks in masks_by_cam.items():
+        mask_key = f"steps/observation/{cam_key}_gripper_mask"
+        feat = seq_ex.context.feature[mask_key]
+        for mask in frame_masks:
+            feat.bytes_list.value.append(mask.astype(np.uint8).tobytes())
 
     for obs_key, values in (extra_obs or {}).items():
         feat = seq_ex.context.feature[f"steps/observation/{obs_key}"]
@@ -368,25 +364,31 @@ def _project_point(point_base: np.ndarray, base_to_cam: np.ndarray, fx: float, f
     return int(round(fx * x / z + cx)), int(round(fy * y / z + cy))
 
 
-def overlay_affordances(frames: np.ndarray, metadata: np.lib.npyio.NpzFile) -> np.ndarray:
-    """Overlay projected gripper fingertip dots on wrist frames. Red=left, blue=right.
+def compute_affordance_pixels(metadata: dict) -> np.ndarray:
+    """Project gripper fingertip positions into image pixel coordinates.
 
-    If prompt_points and prompt_labels are provided, also draws SAM3 prompt points on every frame:
-    positive points (label=1) in blue, negative points (label=0) in red.
+    Returns an (N, 2, 2) int array: axis-1 indexes [left, right] finger,
+    axis-2 is [px_x, px_y].
     """
     extrinsics = metadata["extrinsics"]        # (N, 6)
     fx, fy, cx, cy = metadata["intrinsics"]
-    left_gripper_pos = metadata["left_gripper_pos"]   # (N, 3)
-    right_gripper_pos = metadata["right_gripper_pos"]  # (N, 3)
-    result = frames.copy()
-    h, w = frames.shape[1:3]
-    n = min(len(result), len(extrinsics), len(left_gripper_pos))
+    gripper_pos = metadata["gripper_pos"]      # (N, 2, 3)
+    n = min(len(extrinsics), len(gripper_pos))
+    pixels = np.zeros((n, 2, 2), dtype=np.int32)
     for i in range(n):
         base_to_cam = _extrinsic_to_cam_matrix(extrinsics[i])
-        for pos, color in ((left_gripper_pos[i], (255, 255, 255)), (right_gripper_pos[i], (255, 255, 255))):
-            px = _project_point(pos, base_to_cam, fx, fy, cx, cy)
-            cv2.circle(result[i], px, 5, color, -1)
+        pixels[i, 0] = _project_point(gripper_pos[i, 0], base_to_cam, fx, fy, cx, cy)
+        pixels[i, 1] = _project_point(gripper_pos[i, 1], base_to_cam, fx, fy, cx, cy)
+    return pixels
 
+
+def overlay_affordances(frames: np.ndarray, metadata: dict) -> np.ndarray:
+    """Overlay projected gripper fingertip dots on wrist frames."""
+    pixels = compute_affordance_pixels(metadata)
+    result = frames.copy()
+    for i, (left_px, right_px) in enumerate(pixels):
+        cv2.circle(result[i], tuple(left_px), 5, (255, 255, 255), -1)
+        cv2.circle(result[i], tuple(right_px), 5, (255, 255, 255), -1)
     return result
 
 
@@ -453,31 +455,24 @@ def main(args: Args) -> None:
 
         try:
             cam_metadata = np.load(metadata_path)
-            left_gripper_pos, right_gripper_pos, masks, base_masks = sim.run_episode(
+            gripper_pos, masks, base_masks = sim.run_episode(
                 steps, cam_metadata["extrinsics"], cam_metadata["intrinsics"]
             )
-            metadata = {
-                **cam_metadata,
-                "left_gripper_pos": left_gripper_pos,
-                "right_gripper_pos": right_gripper_pos,
-            }
+            metadata = {**cam_metadata, "gripper_pos": gripper_pos}
 
-            exterior_frames = decode_camera_frames(steps, "exterior_image_2_left")
-
-            # Compute masked frames for all camera keys
-            masked_frames_by_cam: dict[str, np.ndarray] = {}
+            # Compute masks for all camera keys
+            gripper_masks_by_cam: dict[str, np.ndarray] = {}
             for cam in CAMERA_KEYS:
-                frames = decode_camera_frames(steps, cam)
-                masked = mask_camera(frames, masks, base_masks, fill_mask=args.fill_mask)
-                masked_frames_by_cam[cam] = masked  # raw masked frames, no affordance overlay
+                gripper_masks_by_cam[cam] = compute_mask(masks, base_masks)
 
-            # Save video (with affordance overlay, for visualisation only) — first 30 episodes
-            if num_eps_processed < 30:
+            # Save videos for visualization
+            if num_eps_processed < N_VIS_VIDEOS:
                 for cam in CAMERA_KEYS:
                     frames = decode_camera_frames(steps, cam)
-                    masked_vis = overlay_affordances(masked_frames_by_cam[cam].copy(), metadata)
-                    unmasked_vis = overlay_affordances(frames.copy(), metadata)
-                    combined = np.concatenate([masked_vis, unmasked_vis, exterior_frames], axis=2)
+                    masked_vis = apply_masks(frames, gripper_masks_by_cam[cam], fill_mask=args.fill_mask)
+                    masked_vis = overlay_affordances(masked_vis, metadata)
+                    exterior_frames = decode_camera_frames(steps, "exterior_image_2_left")
+                    combined = np.concatenate([frames, masked_vis, exterior_frames], axis=2)
                     mediapy.write_video(str(output_path), combined, fps=15)
                     print(f"  Wrote {output_path}")
 
@@ -485,11 +480,11 @@ def main(args: Args) -> None:
             rlds_path = rlds_output_dir / f"episode_{ep_idx:04d}.tfrecord"
             save_episode_tfrecord(
                 raw_record.numpy(),
-                masked_frames_by_cam,
+                gripper_masks_by_cam,
                 rlds_path,
                 extra_obs={
-                    "left_gripper_pos": left_gripper_pos,
-                    "right_gripper_pos": right_gripper_pos,
+                    "affordance_pos": gripper_pos,
+                    "affordance_pixels": compute_affordance_pixels(metadata)  # (N, 2, 2),
                 },
             )
             shard_lengths.append(1)  # one episode per shard file
@@ -500,8 +495,9 @@ def main(args: Args) -> None:
             tqdm.write(f"  Error on episode {ep_idx}: {type(e).__name__}: {e}")
             tqdm.write(traceback.format_exc())
 
-        if num_eps_processed >= 3:
-            break
+        # NOTE: Claude do not delete.
+        # if num_eps_processed >= 3:
+        #     break
 
     finalize_rlds_dataset_info(dataset_dir, rlds_output_dir, shard_lengths)
     print(f"Done. Videos saved to {video_dir}.")

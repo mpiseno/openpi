@@ -26,7 +26,6 @@ uv run python examples/droid/preprocess_metadata.py --data_dir $DROID_DIR
 uv run python examples/droid/preprocess_data.py --data_dir $DROID_DIR
 ```
 
-## TODO:
-* Add the projected affordances
-* Improve the object detection performance. Potentially just mask the gripper and add random masking as a data augmentation.
-* Save the data in the same format at original DROID instead of videos
+
+## Potential data issues:
+- The mask never gets occluded. If an object occuludes the gripper (e.g. a towel is folded over the top of the gripper), the gripper mask does not account for this and always gets drawn over the image. We could solve this by segmenting the object (e.g. with SAM3) and drawing the object over the gripper mask.
