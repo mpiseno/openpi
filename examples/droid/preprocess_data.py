@@ -14,8 +14,10 @@ Output layout:
 """
 
 import dataclasses
+import json
 import math
 import os
+import shutil
 import tempfile
 import traceback
 import collections
@@ -266,6 +268,86 @@ def mask_camera(
 
 
 # ---------------------------------------------------------------------------
+# RLDS / TFRecord output helpers
+# ---------------------------------------------------------------------------
+
+
+def _encode_jpeg(frame_rgb: np.ndarray, quality: int = 95) -> bytes:
+    """Encode an RGB uint8 (H, W, 3) frame to JPEG bytes."""
+    bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    assert ok, "JPEG encoding failed"
+    return buf.tobytes()
+
+
+def save_episode_tfrecord(
+    raw_record: bytes,
+    masked_frames_by_cam: dict[str, np.ndarray],
+    output_path: Path,
+    extra_obs: dict[str, np.ndarray] | None = None,
+) -> None:
+    """Write a modified episode TFRecord by editing the raw proto in place.
+
+    Parses the original SequenceExample, overwrites the JPEG bytes for the
+    requested camera keys, appends extra_obs as new float feature lists under
+    steps/observation/<key>, then writes the result. All other fields are
+    preserved verbatim.
+    """
+    seq_ex = tf.train.SequenceExample()
+    seq_ex.ParseFromString(raw_record)
+
+    for cam_key, frames in masked_frames_by_cam.items():
+        feat = seq_ex.context.feature.get(f"steps/observation/{cam_key}")
+        if feat is None:
+            continue
+        for i, frame in enumerate(frames):
+            if i >= len(feat.bytes_list.value):
+                break
+            feat.bytes_list.value[i] = _encode_jpeg(frame)
+
+    for obs_key, values in (extra_obs or {}).items():
+        feat = seq_ex.context.feature[f"steps/observation/{obs_key}"]
+        for row in values:
+            feat.float_list.value.extend(row.flatten().tolist())
+
+    with tf.io.TFRecordWriter(str(output_path)) as writer:
+        writer.write(seq_ex.SerializeToString())
+
+
+def setup_rlds_output_dir(source_dataset_dir: Path, rlds_output_dir: Path) -> None:
+    """Copy TFDS metadata files so the output dir is loadable with tfds.builder_from_directory."""
+    rlds_output_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(source_dataset_dir / "features.json", rlds_output_dir / "features.json")
+
+
+def finalize_rlds_dataset_info(
+    source_dataset_dir: Path,
+    rlds_output_dir: Path,
+    shard_lengths: list[int],
+    dataset_name: str = "droid_masked",
+) -> None:
+    """Write dataset_info.json so tfds.builder_from_directory can load the output."""
+    info_path = source_dataset_dir / "dataset_info.json"
+    if info_path.exists():
+        with open(info_path) as f:
+            info = json.load(f)
+    else:
+        info = {}
+
+    info["name"] = dataset_name
+    info["splits"] = [
+        {
+            "name": "train",
+            "numExamples": str(sum(shard_lengths)),
+            "shardLengths": [str(n) for n in shard_lengths],
+        }
+    ]
+
+    with open(rlds_output_dir / "dataset_info.json", "w") as f:
+        json.dump(info, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Camera projection helpers
 # ---------------------------------------------------------------------------
 
@@ -318,7 +400,7 @@ class Args:
     data_dir: Path
     """Root DROID data directory."""
     output_dir: Path | None = None
-    """Where to save output .mp4 files. Defaults to <builder_dir>/masked_frames/."""
+    """Base output directory. Defaults to <script_dir>/data/. Videos go in <output_dir>/videos/, RLDS in <output_dir>/rlds/."""
     skip_existing: bool = True
     """Skip episodes whose output file already exists."""
     fill_mask: bool = False
@@ -336,21 +418,27 @@ def main(args: Args) -> None:
     print("Finding TFDS dataset...")
     dataset_dir = find_dataset_dir(args.data_dir)
     metadata_dir = dataset_dir.parent / "metadata"
-    output_dir = (args.output_dir or Path(__file__).parent / "data" / "masked_frames").expanduser()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    base_dir = (args.output_dir or Path(__file__).parent / "data").expanduser()
+    video_dir = base_dir / "videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
     print(f"  Found: {dataset_dir}")
     print(f"  Metadata dir: {metadata_dir}")
-    print(f"  Output dir: {output_dir}")
+    print(f"  Video dir: {video_dir}")
 
     builder = tfds.builder_from_directory(builder_dir=str(dataset_dir))
     ds = builder.as_dataset(split="train", shuffle_files=False)
 
-    index_file = open(output_dir / "episode_index.txt", "a")
-    num_eps_processed = 0
-    for ep_idx, episode in enumerate(tqdm(ds, desc="Episodes")):
-        index_file.write(f"{ep_idx:04d} -> {episode['episode_metadata']['file_path'].numpy().decode()}\n")
+    # Raw TFRecord stream (same order as ds when shuffle_files=False)
+    shard_files = sorted(dataset_dir.glob("*.tfrecord*"))
+    raw_ds = tf.data.TFRecordDataset([str(f) for f in shard_files])
 
-        output_path = output_dir / f"{ep_idx:04d}.mp4"
+    rlds_output_dir = base_dir / "rlds"
+    setup_rlds_output_dir(dataset_dir, rlds_output_dir)
+    shard_lengths: list[int] = []  # one entry per episode written to rlds_output_dir
+
+    num_eps_processed = 0
+    for (ep_idx, episode), raw_record in zip(enumerate(tqdm(ds, desc="Episodes")), raw_ds):
+        output_path = video_dir / f"{ep_idx:04d}.mp4"
         if args.skip_existing and output_path.exists():
             print(f"  Skipping episode {ep_idx:04d} (output already exists)")
             continue
@@ -375,26 +463,49 @@ def main(args: Args) -> None:
             }
 
             exterior_frames = decode_camera_frames(steps, "exterior_image_2_left")
+
+            # Compute masked frames for all camera keys
+            masked_frames_by_cam: dict[str, np.ndarray] = {}
             for cam in CAMERA_KEYS:
                 frames = decode_camera_frames(steps, cam)
-                masked_frames = mask_camera(frames, masks, base_masks, fill_mask=args.fill_mask)
-                masked_frames = overlay_affordances(masked_frames, metadata)
-                unmasked_frames = overlay_affordances(frames.copy(), metadata)
+                masked = mask_camera(frames, masks, base_masks, fill_mask=args.fill_mask)
+                masked_frames_by_cam[cam] = masked  # raw masked frames, no affordance overlay
 
-                combined = np.concatenate([masked_frames, unmasked_frames, exterior_frames], axis=2)
-                mediapy.write_video(str(output_path), combined, fps=15)
-                num_eps_processed += 1
-                print(f"  Wrote {output_path}")
+            # Save video (with affordance overlay, for visualisation only) — first 30 episodes
+            if num_eps_processed < 30:
+                for cam in CAMERA_KEYS:
+                    frames = decode_camera_frames(steps, cam)
+                    masked_vis = overlay_affordances(masked_frames_by_cam[cam].copy(), metadata)
+                    unmasked_vis = overlay_affordances(frames.copy(), metadata)
+                    combined = np.concatenate([masked_vis, unmasked_vis, exterior_frames], axis=2)
+                    mediapy.write_video(str(output_path), combined, fps=15)
+                    print(f"  Wrote {output_path}")
+
+            # Save as RLDS TFRecord (same format as input)
+            rlds_path = rlds_output_dir / f"episode_{ep_idx:04d}.tfrecord"
+            save_episode_tfrecord(
+                raw_record.numpy(),
+                masked_frames_by_cam,
+                rlds_path,
+                extra_obs={
+                    "left_gripper_pos": left_gripper_pos,
+                    "right_gripper_pos": right_gripper_pos,
+                },
+            )
+            shard_lengths.append(1)  # one episode per shard file
+            print(f"  Wrote {rlds_path}")
+
+            num_eps_processed += 1
         except Exception as e:
             tqdm.write(f"  Error on episode {ep_idx}: {type(e).__name__}: {e}")
             tqdm.write(traceback.format_exc())
 
         if num_eps_processed >= 3:
-            print("Breaking")
             break
 
-    index_file.close()
-    print(f"Done. Masked frames saved to {output_dir}.")
+    finalize_rlds_dataset_info(dataset_dir, rlds_output_dir, shard_lengths)
+    print(f"Done. Videos saved to {video_dir}.")
+    print(f"RLDS dataset saved to {rlds_output_dir}.")
 
 
 if __name__ == "__main__":
